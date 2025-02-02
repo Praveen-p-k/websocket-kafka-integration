@@ -1,0 +1,257 @@
+name: CI-CD pipeline
+on:
+  push:
+    branches:
+      - 'dev'
+      - 'qa'
+env:
+  # Set environment variables based on the branch
+  GCP_PROJECT_ID: ${{ github.ref == 'refs/heads/dev' && secrets.GCP_PROJECT_ID_DEV || github.ref == 'refs/heads/qa' && secrets.GCP_PROJECT_ID_QA }}
+  GCP_SA_KEY: ${{ github.ref == 'refs/heads/dev' && secrets.GCP_SA_KEY_DEV || github.ref == 'refs/heads/qa' && secrets.GCP_SA_KEY_QA }}
+  AR_REPO_NAME: ${{ github.ref == 'refs/heads/dev' && secrets.AR_REPOSITORY_DEV || github.ref == 'refs/heads/qa' && secrets.AR_REPOSITORY_QA }}
+  GKE_CLUSTER_NAME: ${{ github.ref == 'refs/heads/dev' && secrets.GKE_CLUSTER_DEV || github.ref == 'refs/heads/qa' && secrets.GKE_CLUSTER_QA }}
+  GKE_CLUSTER_REGION: ${{ github.ref == 'refs/heads/dev' && secrets.GKE_REGION_DEV || github.ref == 'refs/heads/qa' && secrets.GKE_REGION_QA }}
+  DOCKER_CONFIG: ${{ github.ref == 'refs/heads/dev' && secrets.DOCKER_CONFIG_DEV || github.ref == 'refs/heads/qa' && secrets.DOCKER_CONFIG_QA }}
+  DOCKER_IMAGE_PATH: ${{ github.ref == 'refs/heads/dev' && secrets.DOCKER_IMAGE_PATH_DEV || github.ref == 'refs/heads/qa' && secrets.DOCKER_IMAGE_PATH_QA }}
+  DEPLOYMENT_NAME: ${{ github.ref == 'refs/heads/dev' && secrets.DEPLOYMENT_NAME_DEV || github.ref == 'refs/heads/qa' && secrets.DEPLOYMENT_NAME_QA }}
+  ENV: ${{ github.ref == 'refs/heads/dev' && secrets.DEV_ENV || github.ref == 'refs/heads/qa' && secrets.QA_ENV }}
+  PAT_GITHUB: ${{ secrets.PAT_GITHUB }}
+
+jobs:
+  validate-env:
+    runs-on: self-hosted
+    steps:
+      - name: Validate environment variables
+        run: |
+          MISSING_VARS=()
+          for var in GCP_PROJECT_ID GCP_SA_KEY AR_REPO_NAME GKE_CLUSTER_NAME GKE_CLUSTER_REGION DOCKER_CONFIG DOCKER_IMAGE_PATH ENV PAT_GITHUB; do
+            if [ -z "${!var}" ]; then
+              MISSING_VARS+=("$var")
+            fi
+          done
+          if [ ${#MISSING_VARS[@]} -gt 0 ]; then
+            echo "Error: Missing environment variables: ${MISSING_VARS[*]}"
+            exit 1
+          fi
+      - name: Validation of env successfully completed
+        run: echo "success"
+
+  authenticate:
+    runs-on: ubuntu-latest
+    needs: validate-env
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          version: 'latest'
+
+  build-image:
+    runs-on: ubuntu-latest
+    needs: authenticate
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Build Docker image
+        run: |
+          IMAGE_NAME="${{ env.DOCKER_CONFIG }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO_NAME }}/${{ env.DOCKER_IMAGE_PATH }}:${{ github.run_number }}"
+          docker build --build-arg ENV_FILE_CONTENT="${{ env.ENV }}" -t $IMAGE_NAME .
+          echo "Built Docker image: $IMAGE_NAME"
+      - name: List Docker images after build
+        run: docker images
+      - name: Save Docker image
+        run: |
+          IMAGE_NAME="${{ env.DOCKER_CONFIG }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO_NAME }}/${{ env.DOCKER_IMAGE_PATH }}:${{ github.run_number }}"
+          docker save $IMAGE_NAME -o image.tar
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar
+
+  # scan-image:
+  #   runs-on: ubuntu-latest
+  #   needs: build-image
+  #   steps:
+  #     - name: Download Docker image artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: docker-image
+  #     - name: Load Docker image
+  #       run: docker load -i image.tar
+  #     - name: Scan Docker image for vulnerabilities
+  #       uses: aquasecurity/trivy-action@0.28.0
+  #       with:
+  #         image-ref: ${{ env.DOCKER_CONFIG }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO_NAME }}/${{ env.DOCKER_IMAGE_PATH }}:${{ github.run_number }}
+  #         format: 'table'
+  #         severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+  #         exit-code: '0'
+  #         output: 'trivy-report.txt'
+  #     - name: Upload Trivy scan report
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: trivy-scan-report
+  #         path: trivy-report.txt
+  #     - name: Notify Slack with Trivy scan result
+  #       env:
+  #         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  #       run: |
+  #         # Check if vulnerabilities exist in the report
+  #         if grep -E "HIGH|CRITICAL" trivy-report.txt; then
+  #           # Prepare a payload for Slack notification for high/critical vulnerabilities
+  #           payload=$(jq -n --arg text ":rotating_light: *High/Critical Vulnerabilities Detected in the Latest Scan* :rotating_light:\n\n*Full Report:* <https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID|View in GitHub>" \
+  #           '{text: $text}')
+  #         else
+  #           # Prepare a success notification payload
+  #           payload=$(jq -n --arg text ":white_check_mark: *No High or Critical Vulnerabilities Found.*\n\n*Full Report:* <https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID|View in GitHub>" \
+  #           '{text: $text}')
+  #         fi
+  #         # Send the payload to Slack
+  #         curl -X POST -H 'Content-type: application/json' --data "$payload" $SLACK_WEBHOOK_URL
+
+  push-image:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - name: Authenticate with Google Cloud for Docker
+        run: gcloud auth configure-docker ${{ env.DOCKER_CONFIG }}
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+      - name: Load Docker image
+        run: |
+          docker load -i image.tar
+          echo "Docker images after loading the artifact:"
+          docker images
+      - name: Push Docker image
+        run: |
+          IMAGE_NAME="${{ env.DOCKER_CONFIG }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO_NAME }}/${{ env.DOCKER_IMAGE_PATH }}:${{ github.run_number }}"
+          docker push $IMAGE_NAME
+
+  slack-notification-on-build:
+    runs-on: ubuntu-latest
+    needs: push-image
+    steps:
+      - name: Get current date and time in IST
+        id: date
+        run: |
+          echo "::set-output name=date::$(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S %Z')"
+      - name: Send Slack notification for success
+        if: ${{ success() }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data "{
+          \"text\": \"IRYSCLOUD : Build Successful.\n\n*Git Information:*\n- Repository: *${{ github.repository }}*\n- Branch: *${{ github.ref_name }}*\n- Workflow: *${{ github.workflow }}*\n- Committer: *${{ github.actor }}*\n- Commit ID: *${{ github.sha }}*\n- Job ID: *${{ github.run_id }}*\n- Run Number: *${{ github.run_number }}*\n- Completed at: *${{ steps.date.outputs.date }}*\",
+          }" "$SLACK_WEBHOOK_URL"
+
+      - name: Send Slack notification for failure
+        if: ${{ failure() }}
+        continue-on-error: false
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data "{
+           "text": "IRYSCLOUD : Build Failed.\n\n*Git Information:*\n- Repository: *${{ github.repository }}*\n- Branch: *${{ github.ref_name }}*\n- Workflow: *${{ github.workflow }}*\n- Committer: *${{ github.actor }}*\n- Commit ID: *${{ github.sha }}*\n- Job ID: *${{ github.run_id }}*\n- Run Number: *${{ github.run_number }}*\n- Failed at: *${{ steps.date.outputs.date }}*",
+          }" "$SLACK_WEBHOOK_URL"
+
+  update-image-tag:
+    runs-on: ubuntu-latest
+    needs: slack-notification-on-build
+    steps:
+      - name: Checkout manifest repository
+        uses: actions/checkout@v4
+        with:
+          repository: irys-cloud/irys-web-socket
+          token: ${{ secrets.PAT_GITHUB }}
+          persist-credentials: false
+          ref: devops-${{ github.ref_name }}
+      - name: Update image tag in irys-web-socket
+        run: |
+          sed -i "s|image:.*|image: ${{ env.DOCKER_CONFIG }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO_NAME }}/${{ env.DOCKER_IMAGE_PATH }}:${{ github.run_number }}|g" deployment.yaml
+      - name: Commit and push updated manifest
+        run: |
+          git config --global user.email "kiruthik.raajmurugan@iryscloud.com"
+          git config --global user.name "GitHub Actions"
+          git add deployment.yaml
+          git commit -m "Updated image tag to devops-${{ github.ref_name }}"
+          git push https://x-access-token:${{ secrets.PAT_GITHUB }}@github.com/irys-cloud/irys-web-socket.git HEAD:devops-${{ github.ref_name }}
+
+  deploy-to-gke:
+    runs-on: ubuntu-latest
+    needs: update-image-tag
+    steps:
+      - name: Checkout manifest repository
+        uses: actions/checkout@v4
+        with:
+          repository: irys-cloud/irys-web-socket
+          token: ${{ secrets.PAT_GITHUB }}
+          persist-credentials: false
+          ref: devops-${{ github.ref_name }}
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+      - name: Set up GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
+          location: ${{ env.GKE_CLUSTER_REGION }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Deploy to GKE
+        run: |
+          kubectl apply -f deployment.yaml
+          kubectl rollout restart deployment $DEPLOYMENT_NAME
+      - name: Wait for Deployment Rollout
+        run: |
+          kubectl rollout status deployment/$DEPLOYMENT_NAME --timeout=300s
+
+  slack-notification-on-deploy:
+    runs-on: self-hosted
+    needs: deploy-to-gke
+    steps:
+      - name: Get current date and time in IST
+        id: date
+        run: |
+          # Set the timezone to IST and get the current date and time
+          export TZ="Asia/Kolkata"
+          echo "date=$(date '+%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_ENV
+
+      - name: Send Slack notification on successful completion
+        if: ${{ success() }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "IRYSCLOUD : Deployment Successful.\n\n*Git Information:*\n- Repository: *${{ github.repository }}*\n- Branch: *${{ github.ref_name }}*\n- Workflow: *${{ github.workflow }}*\n- Committer: *${{ github.actor }}*\n- Commit ID: *${{ github.sha }}*\n- Job ID: *${{ github.run_id }}*\n- Run Number: *${{ github.run_number }}*\n- Completed at: *${{ env.date }}*"
+          }' $SLACK_WEBHOOK_URL
+
+      - name: Send Slack notification on failure
+        if: ${{ failure() }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "IRYSCLOUD : Deployment Failed.\n\n*Git Information:*\n- Repository: *${{ github.repository }}*\n- Branch: *${{ github.ref_name }}*\n- Workflow: *${{ github.workflow }}*\n- Committer: *${{ github.actor }}*\n- Commit ID: *${{ github.sha }}*\n- Job ID: *${{ github.run_id }}*\n- Run Number: *${{ github.run_number }}*\n- Failed at: *${{ env.date }}*"
+          }' $SLACK_WEBHOOK_URL
+
+  cleanup:
+    runs-on: self-hosted
+    needs: deploy-to-gke
+    if: always()
+    steps:
+      - name: Clean up Docker images
+        run: docker rmi $(docker images -q --filter "dangling=true") || true
+      - name: Remove unused images
+        run: |
+          docker image prune -a --force || true

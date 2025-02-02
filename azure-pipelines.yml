@@ -1,0 +1,10 @@
+trigger:
+  branches:
+    include:
+    - main
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: ADO-Management/BuildTemplates  
